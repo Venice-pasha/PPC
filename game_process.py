@@ -2,9 +2,10 @@ import threading
 import queue
 import random
 import structure as s 
-
+import socket
 import copy
 import multiprocessing
+import time
 
 class Game:
     def __init__(self, number_of_players):
@@ -27,32 +28,97 @@ class Game:
         listen_process.start()
         self.turn_start = [multiprocessing.Event() for _ in range(number_of_players)]
         self.turn_end = [multiprocessing.Event() for _ in range(number_of_players)]
+        self.server_main('127.0.0.1', 65432)
 
-        # 创建和启动玩家线程
-        self.player_processes = []
-        for i in range(number_of_players):
-            process = multiprocessing.Process(target=self.player_action, args=(i,))
-            self.player_processes.append(process)
-            process.start()
-        self.init_barrier.wait()
-        #index=0事件开始
-        while not self.game_over.is_set():
-            with self.lock:
-                current_player = self.current_turn.value
-            self.turn_start[current_player].set()  # 通知当前玩家开始回合
 
-            # 等待当前玩家结束回合
-            self.turn_end[current_player].wait()
-            self.turn_end[current_player].clear()
 
-            # 更新到下一个玩家
-            with self.lock:
-                self.current_turn.value = (self.current_turn.value + 1) % number_of_players
-        #这里添加游戏内容
-        # self.game_barrier.wait()
-        # 等待所有线程完成
-        for process in self.player_processes:
-            process.join()
+    def server_main(self,server_ip, server_port):
+    # 存储客户端连接
+        client_connections = []
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((server_ip, server_port))
+            s.listen()
+
+            print(f"Server listening on {server_ip}:{server_port}. Waiting for {self.number_of_players} players to connect.")
+
+            # 等待直到所有玩家连接
+            while len(client_connections) < self.number_of_players:
+                conn, addr = s.accept()
+                print(f"Player connected from {addr}")
+                client_connections.append(conn)
+            self.client_connections=client_connections
+            # 所有玩家都已连接，开始主游戏逻辑
+            print("All players connected. Starting game.")
+                    # 创建和启动玩家线程
+            self.player_processes = []
+            for i in range(self.number_of_players):
+                process = multiprocessing.Process(target=self.player_action, args=(i,))
+                self.player_processes.append(process)
+                process.start()
+            self.init_barrier.wait()
+            time.sleep(3)
+            #index=0事件开始
+            while not self.game_over.is_set():
+                with self.lock:
+                    current_player = self.current_turn.value
+                self.turn_start[current_player].set()  # 通知当前玩家开始回合
+                self.turn_end[current_player].wait()
+                self.turn_end[current_player].clear()
+                with self.lock:
+                    self.current_turn.value = (self.current_turn.value + 1) % self.number_of_players
+            # self.game_barrier.wait()
+            # 等待所有线程完成
+            for process in self.player_processes:
+                process.join()
+
+
+    def broadcast(self, message):
+        encoded_message = f"Broadcast: {message}".encode()
+        for conn in self.client_connections:
+            try:
+                conn.sendall(encoded_message)
+            except socket.error as e:
+                print(f"Error sending message to client: {e}")
+    
+    def unicast_info(self,message,index):
+        if index < len(self.client_connections):
+            encoded_message = f"Info: {message}".encode()
+            try:
+                self.client_connections[index].sendall(encoded_message)
+            except socket.error as e:
+                print(f"Error sending info to client {index}: {e}")
+        else:
+            print(f"Invalid client index: {index}")
+
+
+    def unicast_input(self,message,index):
+        if index < len(self.client_connections):
+            encoded_message = f"Input: {message}".encode()
+            response_received=False
+            try:
+                conn = self.client_connections[index]
+                conn.sendall(encoded_message)
+                while not response_received:
+                    try:
+                        conn.settimeout(0.1)
+                        response = conn.recv(1024).decode().strip()
+                        if response:
+                            response_received = True
+                            return response
+                    except socket.timeout:
+                        pass
+            except socket.error as e:
+                print(f"Error sending input request to client {index}: {e}")
+        else:
+            print(f"Invalid client index: {index}")
+
+
+    def close_all_connections(self):
+        """关闭所有客户端连接"""
+        for conn in self.client_connections:
+            conn.close()
+        self.client_connections = []
 
     def listen_to_son(self):
         while not self.game_over.is_set():
@@ -60,7 +126,6 @@ class Game:
                 message = self.to_main_queue.get()
                 print("Main thread received:", message)
                 if message.startswith("Information"):
-                    # 解析消息以获取 player_dest
                     parts = message.split(":")
                     player_dest = int(parts[1].split()[1])  # 假设消息格式正确
 
@@ -73,6 +138,7 @@ class Game:
                 elif message.startswith("Discard"):
                     for i in range(self.number_of_players):
                         self.to_child_queues[i].put(message)
+                elif message.startwith("choose action:"):
                     pass
                 else:
                     # 处理其他类型的消息
@@ -91,80 +157,97 @@ class Game:
         return {color: 0 for color in self.colors}
     
     def show_sight(self,player_index):
-        for index, player_hand in enumerate(self.players_hands):
-            if index != player_index:
-                print(f"Player {index}'s cards: {player_hand}\n")
-            else:
-                print(f"You are {index} you cannot see your card\n")
+        with self.lock:
+            message=(f"show {player_index}'s sight\n")
+            self.unicast_info(message,player_index)
+            for index, player_hand in enumerate(self.players_hands):
+                if index != player_index:
+                    message=(f"Player {index}'s cards: {player_hand}\n")
+                    self.unicast_info(message,player_index)
+                else:
+                    message=(f"You are {index} you cannot see your card\n")
+                    self.unicast_info(message,player_index)
 
-    def print_vpool(self):
-        print("Victory Pool:")
-        for color, highest_number in self.victory_pool.items():
-            print(f"  Color {color}: highest card number {highest_number}\n")
-        total_cards = sum(self.victory_pool.values())
-        total_score = total_cards
-        print(f"Total score: {total_score}\n")
+    def print_vpool(self,player_index):
+        with self.lock:
+            message=("Victory Pool:")
+            self.unicast_info(message,player_index)
+            for color, highest_number in self.victory_pool.items():
+                message=(f"  Color {color}: highest card number {highest_number}\n")
+                self.unicast_info(message,player_index)
+            total_cards = sum(self.victory_pool.values())
+            total_score = total_cards
+            message=(f"Total score: {total_score}\n")
+            self.unicast_info(message,player_index)
 
     def is_game_over(self):
         # case1: victory
         all_fireworks_completed = all(value == 5 for value in self.victory_pool.values())
         if all_fireworks_completed:
-            print("Victory! All fireworks are completed.\n")
+            message=("Victory! All fireworks are completed.\n")
+            self.broadcast(message)
             self.game_over=True
-
         # case2: fuse token all used
-        if self.fuse_tokens.count == 0:
-            print("Game over! All fuse tokens are used.\n")
+        if self.fuse_tokens.value == 0:
+            message=("Game over! All fuse tokens are used.\n")
+            self.broadcast(message)
             self.game_over=True
-
         # case3: deck all used
         if not self.deck:
-            print("Game over! No more cards in the deck.\n")
+            message=("Game over! No more cards in the deck.\n")
+            self.broadcast(message)
             self.game_over=True
-
-        print("Game continues.\n")
+        message=("Game continues.\n")
+        self.broadcast(message)
 
     def card_action(self, player_index,player_hand):
-        self.input_action()
+        action=self.input_action(player_index)
         action_success=False
         while not action_success:
-            if self.action == 'inform':
+            if action == 'inform':
                 action_success=self.inform(player_index)
-            elif self.action == 'play':
+            elif action == 'play':
                 action_success=self.play_card(player_index,player_hand)
-            elif self.action == 'discard':
+            elif action == 'discard':
                 action_success=self.discard_card(player_index,player_hand)
 
-    def input_action(self):
+    def input_action(self,player_index):
         input_sucess=False
         while not input_sucess:
-            action_index=input("type your action index,1 for inform, 2 for play card,3 for discard\n")
+            message=(f"input action of {player_index}:type your action index,1 for inform, 2 for play card,3 for discard\n")
+            action_index=self.unicast_input(message,player_index)
             if action_index=='1':
-                if self.information_tokens.count <= 0:
-                    print("No information tokens left. Cannot give information.\n")
+                if self.information_tokens.value <= 0:
+                    message=("No information tokens left. Cannot give information.\n")
+                    self.unicast_info(message,player_index)
                 else:
                     input_sucess=True
-                    self.action='inform'
+                    action='inform'
             elif action_index=='2':
                 input_sucess=True
-                self.action='play'
+                action='play'
             elif action_index=='3':
                 input_sucess=True
-                self.action='discard'
+                action='discard'
             else:
-                print("wrong index!Try again.\n")
+               message=("wrong index!Try again.\n")
+               self.unicast_info(message,player_index)
+        return action
 
     def inform(self,player_index):
         # input and verify the info dest
         input_sucess=False
         while not input_sucess:
-            player_dest=input("type player dest:")
+            message=(f"input action of {player_index}:type player dest\n")
+            player_dest=self.unicast_input(message,player_index)
             if player_dest.isdigit():
                 player_dest=int(player_dest)
                 if player_index==player_dest:
-                    print("Can not use info token to yourself!\n")
+                    message=("Can not use info token to yourself!\n")
+                    self.unicast_info(message,player_index)
                 elif player_dest>=self.number_of_players or player_dest<0:
-                    print("illegal index! The number you type must be limited into the number of player!\n")
+                    message=("illegal index! The number you type must be limited into the number of player!\n")
+                    self.unicast_info(message,player_index)
                 else:
                     input_sucess=True
             else:
@@ -172,7 +255,8 @@ class Game:
         # input and verify the action info
         input_sucess=False
         while not input_sucess:
-            action_info=input("action of inform, type a color or a number of card\n")
+            message=("action of inform, type a color or a number of card\n")
+            action_info=self.unicast_input(message,player_index)
             if action_info.isdigit() and int(action_info) in [1, 2, 3, 4, 5]:
                 action_info = int(action_info)
                 input_sucess = True
@@ -181,10 +265,12 @@ class Game:
                 input_sucess = True
                 input_type = 'color'
             else:
-                print("illegal info!\n")
+                message=("illegal info!\n")
+                self.unicast_info(message,player_index)
+                time.sleep(0.5)
         # Execution
         with self.lock:
-            self.information_tokens.count -= 1
+            self.information_tokens.value -= 1
         player_hand=self.players_hands[player_dest]
         if (input_type == 'color'):
             qty,place=self.info_cardcolor(player_hand,action_info)
@@ -221,12 +307,14 @@ class Game:
     def play_card(self, player_index, player_hand):
         input_success=False
         while not input_success:
-            card_index=input("which card do you want to play, choose from 0 to 4:")
+            message="which card do you want to play, choose from 0 to 4:"
+            card_index=self.unicast_input(message,player_index)
             if card_index.isdigit() and int(card_index) in [1, 2, 3, 4, 0]:
                 card_index = int(card_index)
                 input_success = True
             else:
-                print("illegal info!\n")
+                message=("illegal info!\n")
+                self.unicast_info(message,player_index)
         card_played=copy.deepcopy(player_hand[card_index])
         color=card_played.color
         number=card_played.number
@@ -240,19 +328,20 @@ class Game:
                 message=(f"Play:you droped your {card_index} with {color} and {number} and lose a fuse_token!\n")'''
         if self.victory_pool[color] == number-1:
             self.victory_pool[color] = number
-            message=(f"Play:you added sucessfully{card_index} with {color} and {number} to victory pool!\n")
+            message=(f"Play:Player{player_index} added sucessfully card{card_index} with {color} and {number} to victory pool!\n")
         else:
-            self.fuse_tokens.count -=1
+            with self.lock:
+                self.fuse_tokens.value -=1
             self.played_cards.append(card_played)
-            message=(f"Play:you droped your {card_index} with {color} and {number} and lose a fuse_token!\n")
-        print(message)
+            message=(f"Play:Player{player_index} droped card{card_index} with {color} and {number} and lose a fuse_token!\n")
         
         self.to_main_queue.put(message)
         '''with self.lock:
             player_hand[player_index]=self.deck.draw_card()
             self.players_hands[player_index]=player_hand'''
         player_hand[player_index]=self.deck.draw_card()
-        self.players_hands[player_index]=player_hand
+        with self.lock:
+            self.players_hands[player_index]=player_hand
         print("a new card is in your hand, replace the card you've used.\n ")
         return True
     
@@ -293,30 +382,33 @@ class Game:
         self.init_barrier.wait()
 
         while not self.game_over.is_set(): 
-            self.turn_start[player_index].wait()  # 等待轮到自己的回合
+            self.turn_start[player_index].wait()
             self.turn_start[player_index].clear()
             if self.game_over.is_set():
                 break
-            print(f"{player_index}'s turn!\n")
+            message=(f"{player_index}'s turn!\n")
+            self.broadcast(message)
             self.show_sight(player_index)
-            self.print_vpool()
+            self.print_vpool(player_index)
             self.card_action(player_index,player_hand)
             self.is_game_over()
-            self.current_turn = (self.current_turn + 1) % self.number_of_players
-            print(f"player {player_index} finished")
+            message=(f"player {player_index} finished")
+            self.broadcast(message)
             self.turn_end[player_index].set()
         #self.game_barrier.wait()
         listen_thread.join()
 
     def listen_to_main(self, player_index):
-        while not self.game_over:
+        while not self.game_over.is_set():
             if not self.to_child_queues[player_index].empty():
                 message = self.to_child_queues[player_index].get()
-                if message.startswith("Input"):
-                    #logic
-                    pass
-                else:
-                    print(f"Player {player_index} received message: {message}")
+                try:
+                    self.unicast_info(message,player_index)
+                except socket.error as e:
+                    print(f"Error sending message to player {player_index}: {e}")
+
+
+            
 
 # 运行游戏
 game = Game(number_of_players=2)
